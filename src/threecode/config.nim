@@ -221,6 +221,11 @@ proc parseConfigFile*(path: string): (string, string, seq[ProviderRec]) =
           of "on", "true", "yes", "1": notifyEnabled = true
           of "off", "false", "no", "0": notifyEnabled = false
           else: discard
+        of "cache":
+          case v.strip.toLowerAscii
+          of "1h", "1hr", "hour", "on": cacheOneHour = true
+          of "5m", "5min", "off": cacheOneHour = false
+          else: discard
         else: discard
       of "provider":
         case e.key
@@ -255,6 +260,8 @@ proc writeConfigFile*(path: string, current: string,
   buf.add "current = " & quoteVal(current) & "\n"
   if activeSearchUrl != "" and activeSearchUrl != DefaultSearchUrl:
     buf.add "search-url = " & quoteVal(activeSearchUrl) & "\n"
+  if not cacheOneHour:
+    buf.add "cache = " & quoteVal("5m") & "\n"
   for pr in providers:
     buf.add "\n[provider]\n"
     buf.add "name = " & quoteVal(pr.name) & "\n"

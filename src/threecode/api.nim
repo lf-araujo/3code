@@ -15,7 +15,7 @@ import std/[algorithm, atomics, hashes, httpclient, json, nativesockets, net, os
 when defined(posix):
   import std/posix except SocketHandle
 import streamhttp
-import types, util, prompts, compact, streamexec
+import types, util, prompts, compact, streamexec, anthropic
 
 type
   VerifyProfileHook* = proc(p: Profile): (bool, string) {.closure.}
@@ -169,13 +169,32 @@ proc parseUsage*(u: JsonNode): Usage =
   if result.cachedTokens == 0:
     result.cachedTokens = u{"prompt_cache_hit_tokens"}.getInt(0)
 
+type ApiDialect* = enum
+  adOpenAI    ## OpenAI chat-completions wire format (every provider but Claude)
+  adAnthropic ## native Claude Messages API (`/v1/messages`)
+
+proc dialectOf*(p: Profile): ApiDialect =
+  if p.family == "claude": adAnthropic else: adOpenAI
+
+proc parseAnthropicUsage(u: JsonNode): Usage =
+  ## Anthropic splits prompt tokens into uncached (`input_tokens`) and cached
+  ## (`cache_read_input_tokens`) plus the one-time `cache_creation_input_tokens`
+  ## write. 3code's bar wants the full prompt size with the cached portion
+  ## broken out, so sum them and surface cache reads as `cachedTokens`.
+  if u == nil or u.kind != JObject: return
+  let inp = u{"input_tokens"}.getInt(0)
+  let cr = u{"cache_read_input_tokens"}.getInt(0)
+  let cc = u{"cache_creation_input_tokens"}.getInt(0)
+  result.promptTokens = inp + cr + cc
+  result.cachedTokens = cr
+
 proc classifyRetry*(exc: ref CatchableError, code: int): string =
   ## Returns "server" for network errors and 5xx, "rate" for 429, "" for
   ## anything else (not retryable). Pure-logic helper for the callModel
   ## retry block.
   if exc != nil: return "server"
   case code
-  of 429: "rate"
+  of 429, 529: "rate"
   of 500, 502, 503, 504: "server"
   else: ""
 
@@ -186,7 +205,7 @@ proc retryCategory*(errMsg: string, assistantMsg: JsonNode, statusCode: int): st
   case statusCode
   of 0:
     if assistantMsg == nil: "server" else: ""
-  of 429: "rate"
+  of 429, 529: "rate"
   of 500, 502, 503, 504: "server"
   else: ""
 
@@ -411,7 +430,8 @@ proc flushTail(f: var XmlToolFilter): string =
   f.pending = ""
 
 proc streamHttp(url, key, bodyStr: string, baseLabel: string,
-                slurped: var int, suppressXml: bool): StreamOutcome =
+                slurped: var int, suppressXml: bool,
+                dialect = adOpenAI): StreamOutcome =
   debugOut "streamHttp start"
   # Post `bodyStr` to `url` and consume SSE chunks until `[DONE]`. `slurped`
   # accumulates an approximate output-character count so the caller can
@@ -469,11 +489,20 @@ proc streamHttp(url, key, bodyStr: string, baseLabel: string,
       cachedStreamHostKey = hostKey
       cachedStreamFd = conn.getFd
     conn.readTimeoutMs = QuietRecvWakeMs
+    let authHeaders =
+      case dialect
+      of adOpenAI:
+        @[("Authorization", "Bearer " & key),
+          ("Content-Type", "application/json"),
+          ("Accept", "text/event-stream")]
+      of adAnthropic:
+        @[("x-api-key", key),
+          ("anthropic-version", AnthropicVersion),
+          ("Content-Type", "application/json"),
+          ("Accept", "text/event-stream")]
     try:
       conn.sendRequest("POST", pathQuery, host,
-                       headers = [("Authorization", "Bearer " & key),
-                                  ("Content-Type", "application/json"),
-                                  ("Accept", "text/event-stream")],
+                       headers = authHeaders,
                        body = bodyStr)
       hookProviderActivity()
       resp = conn.readResponseHead()
@@ -527,56 +556,106 @@ proc streamHttp(url, key, bodyStr: string, baseLabel: string,
       break
     if line.startsWith("data: "):
       let payload = line["data: ".len .. ^1]
-      if payload.strip == "[DONE]":
+      if dialect == adOpenAI and payload.strip == "[DONE]":
         sawDone = true
         continue
       let j = try: parseJson(payload) except CatchableError: continue
-      let choices = j{"choices"}
-      if choices != nil and choices.kind == JArray and choices.len > 0:
-        let fr = choices[0]{"finish_reason"}
-        if fr != nil and fr.kind == JString and fr.getStr.len > 0:
-          sawFinish = true
-        let delta = choices[0]{"delta"}
-        if delta != nil and delta.kind == JObject:
-          # Reasoning chunks arrive on `reasoning_content` (DeepSeek, Qwen,
-          # Kimi) or `reasoning` (a few others). Always accumulate so we can
-          # echo back on the next turn; only render the ticker when enabled.
-          var r = delta{"reasoning_content"}.getStr("")
-          if r.len == 0: r = delta{"reasoning"}.getStr("")
-          if r.len > 0:
-            accReasoning &= r
-            slurped += r.len
-            hookProgress(baseLabel, slurped)
-            if not contentStarted:
-              hookReasoningDelta(accReasoning, baseLabel, slurped, contentStarted)
-          let c = delta{"content"}.getStr("")
-          if c.len > 0:
-            accContent &= c
-            slurped += c.len
-            hookProgress(baseLabel, slurped)
-            let visible =
-              if suppressXml: feed(xmlFilter, c)
-              else: c
-            if visible.len > 0:
-              contentStarted = hookContentDelta(visible, baseLabel, slurped)
-          let tcDelta = delta{"tool_calls"}
-          if tcDelta != nil and tcDelta.kind == JArray:
-            for tc in tcDelta:
-              let idx = tc{"index"}.getInt(0)
-              if idx notin accTools:
-                accTools[idx] = %*{
-                  "id": "", "type": "function",
-                  "function": {"name": "", "arguments": ""}
-                }
-              accumulateToolCall(accTools[idx], tc)
-              # tool args bytes also count as "output" for slurp feel
-              let fn = tc{"function"}
-              if fn != nil:
-                slurped += fn{"arguments"}.getStr("").len
+      if dialect == adOpenAI:
+        let choices = j{"choices"}
+        if choices != nil and choices.kind == JArray and choices.len > 0:
+          let fr = choices[0]{"finish_reason"}
+          if fr != nil and fr.kind == JString and fr.getStr.len > 0:
+            sawFinish = true
+          let delta = choices[0]{"delta"}
+          if delta != nil and delta.kind == JObject:
+            # Reasoning chunks arrive on `reasoning_content` (DeepSeek, Qwen,
+            # Kimi) or `reasoning` (a few others). Always accumulate so we can
+            # echo back on the next turn; only render the ticker when enabled.
+            var r = delta{"reasoning_content"}.getStr("")
+            if r.len == 0: r = delta{"reasoning"}.getStr("")
+            if r.len > 0:
+              accReasoning &= r
+              slurped += r.len
+              hookProgress(baseLabel, slurped)
+              if not contentStarted:
+                hookReasoningDelta(accReasoning, baseLabel, slurped, contentStarted)
+            let c = delta{"content"}.getStr("")
+            if c.len > 0:
+              accContent &= c
+              slurped += c.len
+              hookProgress(baseLabel, slurped)
+              let visible =
+                if suppressXml: feed(xmlFilter, c)
+                else: c
+              if visible.len > 0:
+                contentStarted = hookContentDelta(visible, baseLabel, slurped)
+            let tcDelta = delta{"tool_calls"}
+            if tcDelta != nil and tcDelta.kind == JArray:
+              for tc in tcDelta:
+                let idx = tc{"index"}.getInt(0)
+                if idx notin accTools:
+                  accTools[idx] = %*{
+                    "id": "", "type": "function",
+                    "function": {"name": "", "arguments": ""}
+                  }
+                accumulateToolCall(accTools[idx], tc)
+                # tool args bytes also count as "output" for slurp feel
+                let fn = tc{"function"}
+                if fn != nil:
+                  slurped += fn{"arguments"}.getStr("").len
+                  hookProgress(baseLabel, slurped)
+        let u = j{"usage"}
+        if u != nil and u.kind == JObject:
+          result.usage = parseUsage(u)
+      else:
+        # Native Claude event stream. Each `data:` line is a typed event;
+        # translate it into the same OpenAI-shaped accumulators the rest of
+        # the loop already consumes (text → accContent, tool_use → accTools,
+        # usage → result.usage). No `[DONE]`; completion is `message_stop`.
+        case j{"type"}.getStr
+        of "message_start":
+          result.usage = parseAnthropicUsage(j{"message"}{"usage"})
+        of "content_block_start":
+          let cb = j{"content_block"}
+          if cb != nil and cb{"type"}.getStr == "tool_use":
+            accTools[j{"index"}.getInt(0)] = %*{
+              "id": cb{"id"}.getStr, "type": "function",
+              "function": {"name": cb{"name"}.getStr, "arguments": ""}
+            }
+        of "content_block_delta":
+          let d = j{"delta"}
+          if d != nil:
+            case d{"type"}.getStr
+            of "text_delta":
+              let c = d{"text"}.getStr
+              if c.len > 0:
+                accContent &= c
+                slurped += c.len
                 hookProgress(baseLabel, slurped)
-      let u = j{"usage"}
-      if u != nil and u.kind == JObject:
-        result.usage = parseUsage(u)
+                contentStarted = hookContentDelta(c, baseLabel, slurped)
+            of "input_json_delta":
+              let idx = j{"index"}.getInt(0)
+              if idx in accTools:
+                let pj = d{"partial_json"}.getStr
+                accTools[idx]["function"]["arguments"] =
+                  %(accTools[idx]["function"]["arguments"].getStr & pj)
+                slurped += pj.len
+                hookProgress(baseLabel, slurped)
+            else: discard
+        of "message_delta":
+          let d = j{"delta"}
+          if d != nil and d{"stop_reason"}.getStr("").len > 0:
+            sawFinish = true
+          let u = j{"usage"}
+          if u != nil and u.kind == JObject and "output_tokens" in u:
+            result.usage.completionTokens = u{"output_tokens"}.getInt(0)
+            result.usage.totalTokens =
+              result.usage.promptTokens + result.usage.completionTokens
+        of "message_stop":
+          sawDone = true
+        of "error":
+          nonSSE.add payload
+        else: discard
     elif line.startsWith("event:") or line.strip.len == 0 or
          line.startsWith(": "):  # SSE comment
       discard
@@ -790,6 +869,14 @@ proc applyKimiReasoning(p: Profile, body: JsonNode) =
     body["chat_template_kwargs"] = %*{"enable_thinking": true}
   else: discard
 
+proc applyClaudeReasoning(p: Profile, body: JsonNode) =
+  ## Anthropic's OpenAI-compatibility endpoint accepts OpenAI's
+  ## `reasoning_effort` (low/medium/high) and maps it to Claude's extended
+  ## thinking depth. Pass the level through directly, same as gpt-oss. If a
+  ## level the endpoint doesn't recognize is sent, it's ignored rather than
+  ## rejected, so the model still runs with its default thinking.
+  body["reasoning_effort"] = %p.reasoning
+
 proc applyReasoning*(p: Profile, body: JsonNode) =
   ## Per-family wire mapping for `Profile.reasoning`. Adding a new
   ## family means: (1) set `reasoning` in the known-good combo table,
@@ -800,6 +887,7 @@ proc applyReasoning*(p: Profile, body: JsonNode) =
   of "deepseek": applyDeepseekReasoning(p, body)
   of "minimax": applyMinimaxReasoning(p, body)
   of "kimi": applyKimiReasoning(p, body)
+  of "claude": applyClaudeReasoning(p, body)
   else: discard
 
 when providerStub:
@@ -812,40 +900,48 @@ proc callModel*(p: Profile, messages: JsonNode, usage: var Usage, lastPromptToke
   when providerStub:
     return callModelStub(p, messages, usage, lastPromptTokens)
   debugOut "callModel start"
-  if p.family == "deepseek":
-    ensureReasoningField(messages)
-  let wireMessages = stripInternalFields(messages)
-  if p.family != "deepseek":
-    for m in wireMessages:
-      if m.kind == JObject and m{"role"}.getStr == "assistant" and m.contains("reasoning_content"):
-        m.delete("reasoning_content")
-  var body = %*{
-    "model": p.model,
-    "messages": wireMessages,
-    "stream": true,
-  }
-  # Include usage in streaming responses only for providers that support it (e.g., OpenAI).
-  # Fireworks and other non‑OpenAI endpoints reject the `include_usage` field.
-  # Include usage in streaming responses for all providers except Fireworks,
-  # which rejects the `include_usage` field.
-  if providerOf(p) != "fireworks":
-    body["stream_options"] = %*{"include_usage": true}
-  body["tools"] = setup(p).tools
-  body["tool_choice"] = %"auto"
-  applyStreamingOptions(p, body)
-  applyGenerationDefaults(p, body)
-  if p.reasoning.len > 0:
-    applyReasoning(p, body)
-  let bodyStr = $body
-  if "\"usage\"" in bodyStr:
-    stderr.writeLine "3code: BUG: usage in wireMessages"
-    for i, m in wireMessages:
-      if m.kind == JObject and "usage" in m:
-        stderr.writeLine "  wireMessages[" & $i & "] has usage role=" & m{"role"}.getStr
-    stderr.writeLine "3code: original messages:"
-    for i, m in messages:
-      if m.kind == JObject and "usage" in m:
-        stderr.writeLine "  messages[" & $i & "] has usage role=" & m{"role"}.getStr
+  let dialect = dialectOf(p)
+  var bodyStr: string
+  var endpoint: string
+  if dialect == adAnthropic:
+    # Native Claude path: own request shape (system/tool_use/input_schema +
+    # cache_control breakpoints) and endpoint. See anthropic.nim.
+    bodyStr = $buildAnthropicBody(p, messages)
+    endpoint = p.url & "/messages"
+  else:
+    if p.family == "deepseek":
+      ensureReasoningField(messages)
+    let wireMessages = stripInternalFields(messages)
+    if p.family != "deepseek":
+      for m in wireMessages:
+        if m.kind == JObject and m{"role"}.getStr == "assistant" and m.contains("reasoning_content"):
+          m.delete("reasoning_content")
+    var body = %*{
+      "model": p.model,
+      "messages": wireMessages,
+      "stream": true,
+    }
+    # Include usage in streaming responses for all providers except Fireworks,
+    # which rejects the `include_usage` field.
+    if providerOf(p) != "fireworks":
+      body["stream_options"] = %*{"include_usage": true}
+    body["tools"] = setup(p).tools
+    body["tool_choice"] = %"auto"
+    applyStreamingOptions(p, body)
+    applyGenerationDefaults(p, body)
+    if p.reasoning.len > 0:
+      applyReasoning(p, body)
+    bodyStr = $body
+    if "\"usage\"" in bodyStr:
+      stderr.writeLine "3code: BUG: usage in wireMessages"
+      for i, m in wireMessages:
+        if m.kind == JObject and "usage" in m:
+          stderr.writeLine "  wireMessages[" & $i & "] has usage role=" & m{"role"}.getStr
+      stderr.writeLine "3code: original messages:"
+      for i, m in messages:
+        if m.kind == JObject and "usage" in m:
+          stderr.writeLine "  messages[" & $i & "] has usage role=" & m{"role"}.getStr
+    endpoint = p.url & "/chat/completions"
   let t0 = epochTime()
   decayLevel(serverRetryLevel, serverLastTs, t0)
   decayLevel(rateRetryLevel, rateLastTs, t0)
@@ -863,8 +959,8 @@ proc callModel*(p: Profile, messages: JsonNode, usage: var Usage, lastPromptToke
   while true:
     inc attempt
     var slurped = 0
-    outcome = streamHttp(p.url & "/chat/completions", p.key, bodyStr,
-                        baseLabel, slurped, xmlToolCallsFallback(p))
+    outcome = streamHttp(endpoint, p.key, bodyStr,
+                        baseLabel, slurped, xmlToolCallsFallback(p), dialect)
     if outcome.errMsg == "interrupted by user":
       hookStopSpinner()
       if outcome.assistantMsg == nil:

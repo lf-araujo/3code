@@ -10,6 +10,7 @@ import std/[httpclient, json, strutils]
 import util
 import types
 import prompts
+import anthropic
 
 proc contextWindowFor*(model: string): int =
   ## Heuristic fallback for models off the known-good table
@@ -87,42 +88,52 @@ proc callSummarizer(p: Profile, messages: JsonNode): string =
   ## Fires a single meta-call to the model with a dedicated summarizer
   ## system prompt and no tools. Returns "" on any failure.
   if p.name == "" or p.url == "" or p.key == "" or p.model == "": return ""
-  # Build a trimmed payload: the summarizer prompt + every non-system
-  # message from the live conversation. Tool_call messages are allowed —
-  # most OpenAI-compatible providers accept them in chat completions even
-  # without a tools parameter as long as the tool/assistant pairing is
-  # intact.
-  let payload = newJArray()
-  payload.add %*{"role": "system", "content": SummarizerSystemPrompt}
-  if messages != nil and messages.kind == JArray:
-    for i in 0 ..< messages.len:
-      let m = messages[i]
-      if i == 0 and m.kind == JObject and m{"role"}.getStr == "system":
-        continue
-      payload.add m
-  let body = %*{
-    "model": p.model,
-    "messages": payload,
-    "max_tokens": SummarizeMaxTokens,
-    "stream": false
-  }
+  # The Claude family goes through the native Messages API: the OpenAI-compat
+  # endpoint returns empty for a tool-call-laden history sent without a tools
+  # parameter. Every other provider uses the OpenAI chat-completions shape,
+  # where tool_call/tool messages are accepted as long as the pairing is intact.
+  let claude = p.family == "claude"
+  var url: string
+  var body: JsonNode
+  var hdrs: seq[(string, string)]
+  if claude:
+    body = buildAnthropicSummaryBody(p, messages, SummarizerSystemPrompt,
+                                     SummarizeMaxTokens)
+    url = p.url & "/messages"
+    hdrs = @[("x-api-key", p.key), ("anthropic-version", AnthropicVersion),
+             ("Content-Type", "application/json")]
+  else:
+    let payload = newJArray()
+    payload.add %*{"role": "system", "content": SummarizerSystemPrompt}
+    if messages != nil and messages.kind == JArray:
+      for i in 0 ..< messages.len:
+        let m = messages[i]
+        if i == 0 and m.kind == JObject and m{"role"}.getStr == "system":
+          continue
+        payload.add m
+    body = %*{
+      "model": p.model, "messages": payload,
+      "max_tokens": SummarizeMaxTokens, "stream": false
+    }
+    url = p.url & "/chat/completions"
+    hdrs = @[("Authorization", "Bearer " & p.key),
+             ("Content-Type", "application/json")]
   var status = 0
   var respBody = ""
   try:
     let client = newHttpClient(timeout = 120_000, userAgent = "3code",
                                sslContext = bundledSslContext())
     defer: client.close()
-    client.headers["Authorization"] = "Bearer " & p.key
-    client.headers["Content-Type"] = "application/json"
-    let resp = client.request(p.url & "/chat/completions",
-                              httpMethod = HttpPost, body = $body)
+    for (k, v) in hdrs: client.headers[k] = v
+    let resp = client.request(url, httpMethod = HttpPost, body = $body)
     status = resp.code.int
     respBody = resp.body
   except CatchableError as e:
     stderr.writeLine "3code: summarize: " & e.msg
     return ""
   if status != 200:
-    stderr.writeLine "3code: summarize: api " & $status
+    stderr.writeLine "3code: summarize: api " & $status & " " &
+      respBody[0 ..< min(200, respBody.len)]
     return ""
   let j = try: parseJson(respBody)
           except CatchableError as e:
@@ -131,11 +142,19 @@ proc callSummarizer(p: Profile, messages: JsonNode): string =
   if "error" in j:
     stderr.writeLine "3code: summarize: " & $j["error"]
     return ""
-  let choices = j{"choices"}
-  if choices == nil or choices.kind != JArray or choices.len == 0: return ""
-  let msg = choices[0]{"message"}
-  if msg == nil or msg.kind != JObject: return ""
-  msg{"content"}.getStr("")
+  if claude:
+    let content = j{"content"}
+    if content == nil or content.kind != JArray: return ""
+    var s = ""
+    for blk in content:
+      if blk{"type"}.getStr == "text": s &= blk{"text"}.getStr
+    s
+  else:
+    let choices = j{"choices"}
+    if choices == nil or choices.kind != JArray or choices.len == 0: return ""
+    let msg = choices[0]{"message"}
+    if msg == nil or msg.kind != JObject: return ""
+    msg{"content"}.getStr("")
 
 type
   ContextAction* = enum

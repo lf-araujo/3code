@@ -14,8 +14,8 @@ import types, util, prompts, session, config, api, compact, display, minline,
   fatprompt
 
 const CommandNames* = [":help", ":tokens", ":clear", ":model", ":provider",
-                      ":reasoning", ":prompt", ":show", ":log", ":sessions",
-                      ":summarize",
+                      ":reasoning", ":cache", ":prompt", ":show", ":log",
+                      ":sessions", ":summarize",
                       ":q", ":quit", ":exit"]
 
 type WizardReadLineHook* = proc(prompt: string, hidden,
@@ -50,7 +50,7 @@ proc classifyCommand*(cmd: string): CommandKind =
   let arg = if sp < 0: "" else: c[sp+1 .. ^1].strip
   let parts = arg.splitWhitespace()
   case name
-  of ":help", ":?", ":tokens", ":show", ":log", ":sessions", ":prompt":
+  of ":help", ":?", ":tokens", ":show", ":log", ":sessions", ":prompt", ":cache":
     ckSafeImmediate
   of ":provider":
     if parts.len == 0:
@@ -625,6 +625,23 @@ proc cmdReasoning(arg: string, prof: var Profile) =
   else:
     errLn "  usage: :reasoning [<level>]"
 
+proc cmdCache(arg: string) =
+  ## Show or set the native-Claude prompt-cache TTL. Persists to `[settings]`.
+  case arg.strip.toLowerAscii
+  of "":
+    hintLn "  cache TTL: ", resetStyle, (if cacheOneHour: "1h" else: "5m"),
+           "  (native Claude prompt cache; :cache 1h | :cache 5m)"
+  of "1h", "1hr", "hour", "on":
+    cacheOneHour = true
+    writeConfigFile(configPath(), activeCurrent, activeProviders)
+    hintLn "  cache TTL set to 1h", resetStyle
+  of "5m", "5min", "off":
+    cacheOneHour = false
+    writeConfigFile(configPath(), activeCurrent, activeProviders)
+    hintLn "  cache TTL set to 5m", resetStyle
+  else:
+    errLn "  usage: :cache [1h|5m]"
+
 proc nearestCommand(name: string): string =
   var bestDist = high(int)
   for c in CommandNames:
@@ -901,6 +918,8 @@ proc handleCommandResult*(cmd: string, messages: var JsonNode,
       session.profileName = prof.name
     of ":reasoning":
       cmdReasoning(arg, prof)
+    of ":cache":
+      cmdCache(arg)
     of ":prompt":
       cmdResponse buildSystemPrompt(prof)
     of ":show":

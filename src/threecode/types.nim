@@ -10,6 +10,12 @@ var experimentalEnabled*: bool = false
   ## Set by `-x`/`--experimental`.
 var debugEnabled*: bool = false
   ## Set by `-D`/`--debug`.
+var cacheOneHour*: bool = true
+  ## Prompt-cache TTL for the native Claude path (`[settings]` `cache`,
+  ## toggled with `:cache`). true → 1-hour `cache_control` breakpoints,
+  ## false → the 5-minute default. 1h keeps the prefix warm across pauses in
+  ## a long session at a 2x cache-write premium (vs 1.25x for 5m); reads are
+  ## ~0.1x either way. No effect on non-Claude providers.
 
 const
   ExitUsage* = 2

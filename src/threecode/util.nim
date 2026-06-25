@@ -1,4 +1,6 @@
-import std/[net, os, sequtils, strformat, strutils, unicode, times]
+import std/[net, os, sequtils, strformat, strutils, times]
+import std/unicode except strip  # strutils.strip is the one we want; unicode's
+                                 # Rune-based overload is ambiguous on Nim 2.0.x
 import types
 import threecode/unicodewidth
 

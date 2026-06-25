@@ -45,7 +45,8 @@ proc usage() {.noreturn.} =
        3code good                   # list known-good provider/variant combos
 
   -m, --model PROVIDER[.MODEL]   pick model from config (overrides [settings])
-  -r, --resume[=ID]    resume latest session from this directory (or by id)
+  -r, --resume[=ID]    resume latest session here (or by id); add a prompt to
+                       continue non-interactively. Idle >1h recaps first.
   -i, --interactive    run prompt then continue interactively
   -l, --list[=all]     list sessions for this directory (or all) and exit
   -g, --good           list known-good provider/variant combos and exit
@@ -234,9 +235,8 @@ proc main() =
     of "good": printKnownGood(); return
     else: discard
 
-  if (resume or forceInteractive) and args.len > 0:
-    let flag = if resume: "--resume" else: "--interactive"
-    die("unexpected argument with " & flag & ": " & args.join(" "), ExitUsage)
+  if forceInteractive and args.len > 0:
+    die("unexpected argument with --interactive: " & args.join(" "), ExitUsage)
 
   showUpdateNoticeMaybe()
   spawnBackgroundUpdateMaybe()
@@ -244,6 +244,10 @@ proc main() =
   let prompt = args.join(" ")
   var session: Session
   var messages: JsonNode
+  var idleRecap = false
+    ## Set when resuming a session idle longer than `RecapIdleSecs`. After
+    ## that long the prompt cache is cold and replaying the full transcript is
+    ## the expensive case, so we collapse it into a recap before continuing.
 
   if resume:
     let path = resolveSessionPath(resumeId, safeCwd())
@@ -253,6 +257,9 @@ proc main() =
       else:
         die("session not found: " & resumeId, ExitConfig)
     (session, messages) = loadSessionFile(path)
+    const RecapIdleSecs = 3600
+    let idle = now().toTime() - getLastModificationTime(path)
+    idleRecap = idle.inSeconds >= RecapIdleSecs
   else:
     messages = %* [{"role": "system", "content": DefaultSystemPrompt}]
     session.created = $now()
@@ -264,12 +271,23 @@ proc main() =
   except SessionLocked as e:
     die(e.msg, ExitConfig)
 
-  if prompt != "" and not resume and not forceInteractive:
-    let prof = loadProfile(model)
+  if prompt != "" and not forceInteractive:
+    # One-shot run. Works for a fresh session and for `--resume <prompt>`:
+    # resume restores the transcript (recapped first if it was idle >1h),
+    # then this prompt continues it non-interactively.
+    let prof =
+      if resume and model == "" and session.profileName != "":
+        loadProfile(session.profileName)
+      else:
+        loadProfile(model)
     if not gateExperimental(prof):
       explainExperimentalGate(prof)
       quit ExitConfig
     session.profileName = prof.name
+    if idleRecap:
+      let dropped = summarizeHistory(messages, prof)
+      if dropped > 0:
+        hintLn &"  · recapped {dropped} earlier messages after >1h idle", resetStyle
     messages.add %*{"role": "user", "content": buildUserMessage(messages, prompt)}
     refreshSystemPrompt(messages, prof)
     try:
@@ -313,6 +331,10 @@ proc main() =
   if prof.name == "":
     prof = bootstrapProvider(editor)
   session.profileName = prof.name
+  if idleRecap and prof.name != "":
+    let dropped = summarizeHistory(messages, prof)
+    if dropped > 0:
+      hintLn &"  · recapped {dropped} earlier messages after >1h idle", resetStyle
   inputEditor = addr(editor)
   inputMessages = addr(messages)
   inputSession = addr(session)
