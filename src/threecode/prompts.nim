@@ -59,7 +59,14 @@ const KnownGoodCombos* = [
     ("zai",       "glm-5-turbo",                                     "glm",      "5",   "turbo",     "on",     0.2, 8192, false, 200_000),
     ("zai",       "glm-5.1",                                         "glm",      "5",   "1",         "on",     0.2, 8192, false, 200_000),
     ("zai",       "glm-5.2",                                         "glm",      "5",   "1",         "high",   0.2, 8192, false, 1_000_000),
-    # qwen is out
+    # qwen — local only, via Ollama's OpenAI-compatible endpoint
+    # (http://localhost:11434/v1). `contextWindow` here is conservative:
+    # Ollama defaults to a 4096-token `num_ctx` regardless of the model's
+    # advertised window unless the user raises it (OLLAMA_CONTEXT_LENGTH
+    # env var, or a Modelfile `PARAMETER num_ctx`); bump this entry's
+    # value if you've configured a larger window locally.
+    ("ollama",    "qwen3-coder",                                     "qwen",     "3",   "coder",     "off",    0.2, 4096, false, 32_000),
+    ("ollama",    "qwen3",                                           "qwen",     "3",   "",          "off",    0.2, 4096, false, 32_000),
     ("deepinfra", "zai-org/GLM-5.1",                                 "glm",      "5",   "1",         "on",     0.2, 8192, false, 200_000),
     ("deepinfra", "zai-org/GLM-5",                                   "glm",      "5",   "",          "on",     0.2, 8192, false, 200_000),
     ("deepinfra", "zai-org/GLM-4.7",                                 "glm",      "4",   "7",         "on",     0.2, 8192, false, 200_000),

@@ -532,10 +532,11 @@ proc streamHttp(url, key, bodyStr: string, baseLabel: string,
     return
   let host = u.hostname
   let plainHttp =
-    when defined(testPlainHttp):
-      u.scheme == "http" and (host == "127.0.0.1" or host == "localhost")
-    else:
-      false
+    u.scheme == "http" and
+    (host == "127.0.0.1" or host == "localhost" or host == "::1")
+    ## Local inference servers (Ollama, LM Studio, llama.cpp) serve plain
+    ## http by default. Allowing it only for loopback keeps the
+    ## https-only rule for anything reachable over the network.
   if u.scheme != "https" and not plainHttp:
     result.errMsg = "only https supported, got: " & u.scheme
     return
@@ -861,10 +862,11 @@ proc callHttp(url, key, bodyStr: string; baseLabel: string;
     return
   let host = u.hostname
   let plainHttp =
-    when defined(testPlainHttp):
-      u.scheme == "http" and (host == "127.0.0.1" or host == "localhost")
-    else:
-      false
+    u.scheme == "http" and
+    (host == "127.0.0.1" or host == "localhost" or host == "::1")
+    ## Local inference servers (Ollama, LM Studio, llama.cpp) serve plain
+    ## http by default. Allowing it only for loopback keeps the
+    ## https-only rule for anything reachable over the network.
   if u.scheme != "https" and not plainHttp:
     result.errMsg = "only https supported, got: " & u.scheme
     return
@@ -1374,6 +1376,69 @@ proc callModelThreaded*(p: Profile, bodyStr, baseLabel: string;
       result.assistantMsg = parseJson(result.assistantMsgJson)
       result.assistantMsgJson = ""
 
+proc ensureOllamaModelPulled(p: Profile) =
+  ## Ollama's OpenAI-compatible endpoint 404s on a model that hasn't been
+  ## pulled yet instead of fetching it, unlike hosted providers where every
+  ## listed model is always available. Check the native `/api/tags` list
+  ## first (cheap, local); if the model isn't there, stream `/api/pull` and
+  ## surface progress on the spinner label until it completes. Runs once
+  ## per call — a no-op after the first successful pull since the model
+  ## then shows up in `/api/tags`.
+  if providerOf(p) != "ollama": return
+  let base = if p.url.endsWith("/v1"): p.url[0 ..< p.url.len - 3] else: p.url
+  let u = try: parseUri(base) except CatchableError: return
+  let host = u.hostname
+  if host != "127.0.0.1" and host != "localhost" and host != "::1": return
+  let port = if u.port.len > 0: Port(parseInt(u.port)) else: Port(11434)
+
+  var have = false
+  try:
+    let client = newHttpClient(timeout = 5_000, userAgent = "3code")
+    defer: client.close()
+    let resp = client.get(base & "/api/tags")
+    if resp.code.int == 200:
+      let models = parseJson(resp.body){"models"}
+      if models != nil and models.kind == JArray:
+        for m in models:
+          let name = m{"name"}.getStr("")
+          if name == p.model or name == p.model & ":latest" or
+             name.split(':')[0] == p.model:
+            have = true
+            break
+  except CatchableError:
+    return  # daemon unreachable; let the normal request surface that error
+  if have: return
+
+  hookStartSpinner("pulling " & p.model)
+  try:
+    let conn = connectPlain(host, port, timeoutMs = ConnectTimeoutMs)
+    defer: conn.close()
+    let body = $(%*{"name": p.model, "stream": true})
+    conn.sendRequest("POST", "/api/pull", host,
+                     headers = [("Content-Type", "application/json")],
+                     body = body)
+    discard conn.readResponseHead()
+    var line = ""
+    while conn.readLine(line):
+      if line.strip.len == 0: continue
+      let j = try: parseJson(line) except CatchableError: continue
+      let errField = j{"error"}
+      if errField != nil:
+        raise newException(ApiError, "ollama pull failed: " & errField.getStr(""))
+      let status = j{"status"}.getStr("")
+      let total = j{"total"}.getBiggestInt(0)
+      let completed = j{"completed"}.getBiggestInt(0)
+      let pct = if total > 0: completed * 100 div total else: 0
+      hookSetStatusLabel("pulling " & p.model & " — " & status &
+                         (if total > 0: " " & $pct & "%" else: ""))
+      if status == "success": break
+  except ApiError:
+    raise
+  except CatchableError as e:
+    raise newException(ApiError, "ollama pull failed: " & e.msg)
+  finally:
+    hookStopSpinner()
+
 when providerStub:
   ## Test-only stub provider. Lives in `testdata/stub/provider.nim` and is
   ## `include`d here so it shares this module's scope (private hook
@@ -1390,6 +1455,7 @@ proc callModel*(p: Profile, messages: JsonNode, usage: var Usage,
   when providerStub:
     return callModelStub(p, messages, usage, lastPromptTokens, maxTokensOverride)
   debugOut "callModel start"
+  ensureOllamaModelPulled(p)
   if p.family == "deepseek":
     ensureReasoningField(messages)
   let wireMessages = stripInternalFields(messages)

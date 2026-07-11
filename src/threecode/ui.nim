@@ -190,12 +190,18 @@ proc promptNameAndUrl(editor: var minline.LineEditor): (string, string) =
 proc promptNewProvider*(editor: var minline.LineEditor): ProviderRec =
   printSupported()
   stdout.write "\n"
-  var key = readRequired(editor, "  api key              : ", hidden = true)
+  # Empty input (just enter) skips key-based inference and drops straight
+  # into `promptNameAndUrl`'s manual provider-name entry below — the path
+  # local/keyless providers (e.g. ollama) need, since they have no key to
+  # paste and infer from.
+  var key = readOptional(editor, "  api key (enter to pick provider instead) : ",
+                         hidden = true)
   # same key already configured?
-  for pr in activeProviders:
-    if pr.key == key:
-      hintLn &"  already configured as {pr.name}", resetStyle
-      return pr
+  if key.len > 0:
+    for pr in activeProviders:
+      if pr.key == key:
+        hintLn &"  already configured as {pr.name}", resetStyle
+        return pr
   var name, url: string
   var inferred = inferProvider(key)
   if not experimentalEnabled and inferred != "" and
@@ -229,6 +235,14 @@ proc promptNewProvider*(editor: var minline.LineEditor): ProviderRec =
       name = n
       url = u
       break
+  if key.len == 0:
+    # Local servers (ollama, llama.cpp, ...) don't check the Authorization
+    # header at all, but the config format and `loadProfile`/`buildProfile`
+    # require a non-empty key for every provider. Fill in a harmless
+    # placeholder rather than relaxing that invariant everywhere — a
+    # provider that actually needs a real key will simply fail
+    # `verifyProfile` below and prompt the user to re-enter one.
+    key = name
   if not experimentalEnabled:
     let curated = curatedFor(name)
     for m in curated:

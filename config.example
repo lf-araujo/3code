@@ -73,6 +73,12 @@ url = "https://api.longcat.chat/openai"
 key = "..."
 models = "LongCat-2.0"
 
+[provider]
+name = "ollama"
+url = "http://localhost:11434/v1"
+key = "ollama"
+models = "qwen3-coder qwen3"
+
 # `family` is an experimental-only override (only honored under
 # `--experimental`) that picks the system-prompt branch by family
 # name, when the (provider, model) combo isn't on the known-good
