@@ -67,6 +67,15 @@ const KnownGoodCombos* = [
     # value if you've configured a larger window locally.
     ("ollama",    "qwen3-coder",                                     "qwen",     "3",   "coder",     "off",    0.2, 4096, false, 32_000),
     ("ollama",    "qwen3",                                           "qwen",     "3",   "",          "off",    0.2, 4096, false, 32_000),
+    # qwen — local only, via a self-hosted llama.cpp `llama-server` (its
+    # OpenAI-compatible endpoint, default http://localhost:8080/v1). The
+    # model id here is whatever `--alias` the server was started with —
+    # "qwen3-coder" is the convention this entry assumes; match it in the
+    # `llama-server -a qwen3-coder ...` invocation. `contextWindow` mirrors
+    # the `-c` value from a typical launch config (`-c 65536`); adjust to
+    # match whatever context size the server was actually started with.
+    ("llamacpp",  "qwen3-coder",                                     "qwen",     "3",   "coder",     "on",     0.2, 4096, false, 65_536),
+    ("llamacpp",  "qwen3",                                           "qwen",     "3",   "",          "on",     0.2, 4096, false, 32_768),
     ("deepinfra", "zai-org/GLM-5.1",                                 "glm",      "5",   "1",         "on",     0.2, 8192, false, 200_000),
     ("deepinfra", "zai-org/GLM-5",                                   "glm",      "5",   "",          "on",     0.2, 8192, false, 200_000),
     ("deepinfra", "zai-org/GLM-4.7",                                 "glm",      "4",   "7",         "on",     0.2, 8192, false, 200_000),

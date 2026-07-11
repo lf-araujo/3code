@@ -79,6 +79,16 @@ url = "http://localhost:11434/v1"
 key = "ollama"
 models = "qwen3-coder qwen3"
 
+[provider]
+name = "llamacpp"
+url = "http://localhost:8080/v1"
+key = "llamacpp"
+models = "qwen3-coder qwen3"
+; models must match the `--alias` the llama-server was started with, e.g.:
+;   llama-server -m /path/to/model.gguf -a qwen3-coder \
+;     -ngl -1 -ncmoe 999 -fa on -np 1 --reasoning on \
+;     -c 65536 -ctv q8_0 -ctk q8_0 -b 512 -ub 512
+
 # `family` is an experimental-only override (only honored under
 # `--experimental`) that picks the system-prompt branch by family
 # name, when the (provider, model) combo isn't on the known-good

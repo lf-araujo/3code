@@ -469,6 +469,7 @@ const ProviderCatalog*: seq[(string, string)] = @[
   ("huggingface", "https://router.huggingface.co/v1"),
   ("hyperbolic",  "https://api.hyperbolic.xyz/v1"),
   ("inceptron",   "https://api.inceptron.io/v1"),
+  ("llamacpp",    "http://localhost:8080/v1"),
   ("minimax",     "https://api.minimax.io/v1"),
   ("minimax-cn",  "https://api.minimaxi.com/v1"),
   ("mistral",     "https://api.mistral.ai/v1"),
