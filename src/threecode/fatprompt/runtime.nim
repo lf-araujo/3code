@@ -13,7 +13,7 @@ import ../types, ../util, ../compact, ../display, ../minline,
 import ../engine as termengine
 import rendering
 from ../api import ApiStreamHooks, requestTurnInterrupt, requestQuietShutdown,
-  setApiStreamHooks, setInterrupted, QuietTooLongMs, clearNetworkQuiet
+  setApiStreamHooks, setInterrupted, quietTimeoutMs, clearNetworkQuiet
 
 
 var contentStreamedLive*: bool = false
@@ -1079,7 +1079,7 @@ proc quietWatchLoop() {.thread.} =
   var lastFiredMs = 0
   while not quietStop.load(moRelaxed):
     let idleMs = nowMs() - lastProviderActivity.load(moRelaxed)
-    if idleMs >= QuietTooLongMs:
+    if idleMs >= quietTimeoutMs():
       # No data for the full window: the provider has gone silent. Wake the
       # blocking recv and mark the connection dead. Deliberately does NOT
       # call `requestTurnInterrupt` — that would set `interruptedFlag` and

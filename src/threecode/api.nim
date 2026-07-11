@@ -86,6 +86,35 @@ proc markNetworkQuiet*() {.gcsafe.} =
 proc clearNetworkQuiet*() {.gcsafe.} =
   networkQuietFlag.store(false, moRelease)
 
+proc isLocalUrl*(url: string): bool =
+  ## True when `url`'s host is loopback (127.0.0.1/localhost/::1) — the
+  ## address local inference servers (Ollama, llama.cpp) bind to. Used to
+  ## give those a longer allowance than a hosted API needs, both for the
+  ## https-only rule (`streamHttp`/`callHttp`) and for verify/quiet-watch
+  ## timeouts, which are tuned for APIs that start responding immediately.
+  let host = try: parseUri(url).hostname except CatchableError: ""
+  host == "127.0.0.1" or host == "localhost" or host == "::1"
+
+const LocalQuietTooLongMs = 180_000
+  ## Local models can take minutes to prefill a large system+tools prompt
+  ## on constrained hardware, and the provider sends zero bytes until the
+  ## first token is ready — `QuietTooLongMs` (tuned for hosted APIs that
+  ## start streaming almost immediately) would otherwise kill and restart
+  ## the request before prefill finishes, looping forever on a slow box.
+
+var quietTimeoutMsAtomic: Atomic[int]
+  ## Runtime ceiling for the "network quiet" watchdog (`quietWatchLoop` in
+  ## fatprompt/runtime.nim), raised for local providers by `callModel`
+  ## before each call. 0 (the zero-value default) means "use
+  ## `QuietTooLongMs`" — see `quietTimeoutMs()`.
+
+proc setQuietTimeoutMs*(ms: int) {.gcsafe.} =
+  quietTimeoutMsAtomic.store(ms, moRelease)
+
+proc quietTimeoutMs*(): int {.gcsafe.} =
+  let v = quietTimeoutMsAtomic.load(moAcquire)
+  if v > 0: v else: QuietTooLongMs
+
 type
   ApiStreamHooks* = object
     beforeCall*: proc(lastPromptTokens, window: int): string {.closure.}
@@ -608,12 +637,12 @@ proc streamHttp(url, key, bodyStr: string, baseLabel: string,
       if resp.status == 0 and resp.headers.len == 0:
         if isNetworkQuiet():
           result.errMsg = "network quiet for " &
-            $(QuietTooLongMs div 1000) & "s)"
+            $(quietTimeoutMs() div 1000) & "s)"
         elif isInterrupted():
           result.errMsg = InterruptedByUserMsg
         else:
           result.errMsg = "network quiet for " &
-            $(QuietTooLongMs div 1000) & "s)"
+            $(quietTimeoutMs() div 1000) & "s)"
         return
       fireActivity(job)
       break
@@ -750,7 +779,7 @@ proc streamHttp(url, key, bodyStr: string, baseLabel: string,
     # connection forever.
     closeCachedStreamConn()
     result.errMsg = "network quiet for " &
-      $(QuietTooLongMs div 1000) & "s"
+      $(quietTimeoutMs() div 1000) & "s"
     return
   if isInterrupted():
     if result.assistantMsg == nil:
@@ -936,7 +965,7 @@ proc callHttp(url, key, bodyStr: string; baseLabel: string;
           result.errMsg = InterruptedByUserMsg
         else:
           result.errMsg = "network quiet for " &
-            $(QuietTooLongMs div 1000) & "s)"
+            $(quietTimeoutMs() div 1000) & "s)"
         return
       hookProviderActivity()
       break
@@ -970,7 +999,7 @@ proc callHttp(url, key, bodyStr: string; baseLabel: string;
   if isNetworkQuiet():
     closeCachedStreamConn()
     result.errMsg = "network quiet for " &
-      $(QuietTooLongMs div 1000) & "s)"
+      $(quietTimeoutMs() div 1000) & "s)"
     return
   if isInterrupted():
     closeCachedStreamConn()
@@ -1361,7 +1390,7 @@ proc callModelThreaded*(p: Profile, bodyStr, baseLabel: string;
   # a first-time getAddrInfo wedge (documented, accepted): if the poll
   # times out we detach rather than block forever.
   var waited = 0
-  let joinBudget = ConnectTimeoutMs + QuietTooLongMs + 5_000
+  let joinBudget = ConnectTimeoutMs + quietTimeoutMs() + 5_000
   while t.running() and waited < joinBudget:
     sleep(NetWorkerPollMs)
     waited += NetWorkerPollMs
@@ -1387,8 +1416,8 @@ proc ensureOllamaModelPulled(p: Profile) =
   if providerOf(p) != "ollama": return
   let base = if p.url.endsWith("/v1"): p.url[0 ..< p.url.len - 3] else: p.url
   let u = try: parseUri(base) except CatchableError: return
+  if not isLocalUrl(base): return
   let host = u.hostname
-  if host != "127.0.0.1" and host != "localhost" and host != "::1": return
   let port = if u.port.len > 0: Port(parseInt(u.port)) else: Port(11434)
 
   var have = false
@@ -1456,6 +1485,7 @@ proc callModel*(p: Profile, messages: JsonNode, usage: var Usage,
     return callModelStub(p, messages, usage, lastPromptTokens, maxTokensOverride)
   debugOut "callModel start"
   ensureOllamaModelPulled(p)
+  setQuietTimeoutMs(if isLocalUrl(p.url): LocalQuietTooLongMs else: QuietTooLongMs)
   if p.family == "deepseek":
     ensureReasoningField(messages)
   let wireMessages = stripInternalFields(messages)
@@ -1654,8 +1684,13 @@ proc verifyProfile*(p: Profile): (bool, string) =
     if isStubUrl(p.url):
       return (true, "")
   let body = verifyBody(p)
+  # Local inference servers (Ollama, llama.cpp) can take minutes to cold-load
+  # a large model into memory on first use, even though the verify ping only
+  # asks for `max_tokens: 1` — the 20s budget that's plenty for a hosted
+  # API's TTFB isn't enough to cover that one-time load.
+  let verifyTimeoutMs = if isLocalUrl(p.url): 300_000 else: 20_000
   try:
-    let client = newHttpClient(timeout = 20_000, userAgent = "3code",
+    let client = newHttpClient(timeout = verifyTimeoutMs, userAgent = "3code",
                                sslContext = bundledSslContext())
     defer: client.close()
     client.headers["Authorization"] = "Bearer " & p.key
